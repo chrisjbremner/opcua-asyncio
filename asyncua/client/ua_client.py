@@ -38,6 +38,7 @@ class UASocketProtocol(asyncio.Protocol):
         self._callbackmap: Dict[int, asyncio.Future] = {}
         self._connection = SecureConnection(security_policy)
         self.state = self.INITIALIZED
+        self.closed: bool = False
 
     def connection_made(self, transport: asyncio.Transport):
         self.state = self.OPEN
@@ -129,12 +130,13 @@ class UASocketProtocol(asyncio.Protocol):
         self.transport.write(msg)
         return future
 
-    async def send_request(self, request, timeout=10, message_type=ua.MessageType.SecureMessage):
+    async def send_request(self, request, timeout=None, message_type=ua.MessageType.SecureMessage):
         """
         Send a request to the server.
         Timeout is the timeout written in ua header.
         Returns response object if no callback is provided.
         """
+        timeout = self.timeout if timeout is None else timeout
         data = await asyncio.wait_for(
             self._send_request(request, timeout, message_type),
             timeout if timeout else None
@@ -160,7 +162,9 @@ class UASocketProtocol(asyncio.Protocol):
                 f"No request found for request id: {request_id}, pending are {self._callbackmap.keys()}"
             )
         except asyncio.InvalidStateError:
-            raise ua.UaError(f"Future for request id {request_id} is already done")
+            if not self.closed:
+                raise ua.UaError(f"Future for request id {request_id} is already done")
+            self.logger.debug(f"Future for request id {request_id} not handled due to disconnect")
         del self._callbackmap[request_id]
 
     def _create_request_header(self, timeout=1) -> ua.RequestHeader:
@@ -281,6 +285,7 @@ class UaClient:
 
     async def create_session(self, parameters):
         self.logger.info("create_session")
+        self.protocol.closed = False
         request = ua.CreateSessionRequest()
         request.Parameters = parameters
         data = await self.protocol.send_request(request)
@@ -302,6 +307,7 @@ class UaClient:
 
     async def close_session(self, delete_subscriptions):
         self.logger.info("close_session")
+        self.protocol.closed = True
         if self._publish_task and not self._publish_task.done():
             self._publish_task.cancel()
         if self.protocol and self.protocol.state == UASocketProtocol.CLOSED:
