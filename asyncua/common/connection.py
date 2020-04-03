@@ -271,7 +271,7 @@ class SecureConnection:
         expected_tokens = [self.security_token.TokenId, self.next_security_token.TokenId]
         if self._allow_prev_token:
             expected_tokens.insert(0, self.prev_security_token.TokenId)
-        raise ua.UaError("Invalid security token id {}, expected one of: {}".format(security_hdr.TokenId, expected_tokens))
+        logger.warning("Invalid security token id {}, expected one of: {}".format(security_hdr.TokenId, expected_tokens))
 
     def _check_incoming_chunk(self, chunk):
         if not isinstance(chunk, MessageChunk):
