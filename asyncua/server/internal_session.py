@@ -93,6 +93,7 @@ class InternalSession(AbstractSession):
             await asyncio.sleep(timeout)
             print(self._last_action_time)
             if (datetime.now() - timeout_timedelta) > self._last_action_time:
+                self.logger.warning('Session timed out after %ss of inactivity', timeout_timedelta.total_seconds())
                 await self.close_session()
 
     @update_last_action_time
