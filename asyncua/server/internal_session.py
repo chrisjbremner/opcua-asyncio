@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import wraps
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
 from asyncua import ua
 from asyncua.common.session_interface import AbstractSession
