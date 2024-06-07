@@ -4,11 +4,10 @@ import sys
 import argparse
 from datetime import datetime, timedelta
 import math
-import time
 import concurrent.futures
 
 try:
-    from IPython import embed
+    from IPython import embed  # type: ignore
 except ImportError:
     import code
 
@@ -95,7 +94,7 @@ def parse_args(parser, requirenodeid=False):
     # logging.basicConfig(format="%(levelname)s: %(message)s", level=getattr(logging, args.loglevel))
     logging.basicConfig(level=getattr(logging, args.loglevel))
     if args.url and "://" not in args.url:
-        logging.info(f"Adding default scheme {ua.OPC_TCP_SCHEME} to URL {args.url}")
+        logging.info("Adding default scheme %s to URL %s", ua.OPC_TCP_SCHEME, args.url)
         args.url = ua.OPC_TCP_SCHEME + "://" + args.url
     if requirenodeid:
         _require_nodeid(parser, args)
@@ -383,7 +382,7 @@ async def _lsprint_0(node, depth, indent=""):
             )
         )
         if depth:
-            await _lsprint_0(Node(node.server, desc.NodeId), depth - 1, indent + "  ")
+            await _lsprint_0(Node(node.session, desc.NodeId), depth - 1, indent + "  ")
 
 
 async def _lsprint_1(node, depth, indent=""):
@@ -394,7 +393,7 @@ async def _lsprint_1(node, depth, indent=""):
     for desc in await node.get_children_descriptions():
         if desc.NodeClass == ua.NodeClass.Variable:
             try:
-                val = await Node(node.server, desc.NodeId).read_value()
+                val = await Node(node.session, desc.NodeId).read_value()
             except UaStatusCodeError as err:
                 val = "Bad (0x{0:x})".format(err.code)
             print(
@@ -416,7 +415,7 @@ async def _lsprint_1(node, depth, indent=""):
                 )
             )
         if depth:
-            await _lsprint_1(Node(node.server, desc.NodeId), depth - 1, indent + "  ")
+            await _lsprint_1(Node(node.session, desc.NodeId), depth - 1, indent + "  ")
 
 
 async def _lsprint_long(pnode, depth, indent=""):
@@ -508,7 +507,7 @@ async def _uasubscribe():
             await sub.subscribe_events(node)
         print("Type Ctr-C to exit")
         while True:
-            time.sleep(1)
+            await asyncio.sleep(1)
     finally:
         await client.disconnect()
 
@@ -589,7 +588,7 @@ async def _uaclient():
 
     try:
         async with client:
-            mynode = await get_node(client, args)
+            await get_node(client, args)
     except (OSError, concurrent.futures.TimeoutError) as e:
         print(e)
         sys.exit(1)
@@ -602,7 +601,7 @@ async def _uaserver():
         description="Run an example OPC-UA server. By importing xml definition and using uawrite "
         " command line, it is even possible to expose real data using this server"
     )
-    # we setup a server, this is a bit different from other tool so we do not reuse common arguments
+    # we set up a server, this is a bit different from other tool, so we do not reuse common arguments
     parser.add_argument(
         "-u",
         "--url",
@@ -669,8 +668,8 @@ async def _uaserver():
         await mywritablevar.set_writable()  # Set MyVariable to be writable by clients
         myvar = await myobj.add_variable(idx, "MyVariable", 6.7)
         myarrayvar = await myobj.add_variable(idx, "MyVarArray", [6.7, 7.9])
-        myprop = await myobj.add_property(idx, "MyProperty", "I am a property")
-        mymethod = await myobj.add_method(
+        await myobj.add_property(idx, "MyProperty", "I am a property")
+        await myobj.add_method(
             idx,
             "MyMethod",
             multiply,

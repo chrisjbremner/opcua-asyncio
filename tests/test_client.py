@@ -79,7 +79,7 @@ async def test_enumstrings_getvalue(server, client):
     The client only 'sees' an TimeoutError
     """
     nenumstrings = client.get_node(ua.ObjectIds.AxisScaleEnumeration_EnumStrings)
-    value = ua.Variant(await nenumstrings.read_value())
+    await nenumstrings.read_value()
 
 
 async def test_custom_enum_struct(server, client):
@@ -103,11 +103,46 @@ async def test_multiple_read_and_write_value(server, client):
 
     vals = await client.read_values([v1, v2, v3])
     assert vals == [1, 2, 3]
-    await client.write_values([v1, v2, v3], [4, 5, 6])
+    rets = await client.write_values([v1, v2, v3], [4, 5, 6])
+    assert rets == [ua.StatusCode(value=ua.StatusCodes.Good), ua.StatusCode(value=ua.StatusCodes.Good), ua.StatusCode(value=ua.StatusCodes.Good)]
     vals = await client.read_values([v1, v2, v3])
     assert vals == [4, 5, 6]
     with pytest.raises(ua.uaerrors.BadUserAccessDenied):
         await client.write_values([v1, v2, v_ro], [4, 5, 6])
+    rets = await client.write_values([v1, v2, v_ro], [4, 5, 6], raise_on_partial_error=False)
+    assert rets == [ua.StatusCode(value=ua.StatusCodes.Good), ua.StatusCode(ua.StatusCodes.Good), ua.StatusCode(ua.StatusCodes.BadUserAccessDenied)]
+
+
+async def test_read_and_write_status_check(server, client):
+    f = await server.nodes.objects.add_folder(3, 'read_and_write_status_check')
+    v1 = await f.add_variable(3, "a", 1)
+    await v1.set_writable()
+
+    testValue = 1
+    testStatusCode = ua.StatusCode(ua.StatusCodes.Bad)
+
+    # set value StatusCode to Bad
+    variant = ua.Variant(testValue, ua.VariantType.Int64)
+    dataValue = ua.DataValue(variant, StatusCode_=testStatusCode)
+    await v1.set_value(dataValue)
+
+    # check that reading the value generates an error
+    # with raise_on_bad_status set to True as default
+    with pytest.raises(ua.UaStatusCodeError):
+        val = await v1.read_data_value()
+
+    # check that reading the value does not generate an error
+    # with raise_on_bad_status set to False
+    val = await v1.read_data_value(False)
+    assert val.Value.Value is None, "Value should be Null if StatusCode is Bad"
+    assert val.StatusCode_ == testStatusCode, "StatusCode expected " \
+        + str(val.StatusCode_) + ", but instead got " + str(testStatusCode)
+
+    # check that reading the value generates an error
+    # with raise_on_bad_status set to True
+    with pytest.raises(ua.UaStatusCodeError):
+        val = await v1.read_data_value(True)
+
 
 async def test_browse_nodes(server, client):
     nodes = [
@@ -123,5 +158,38 @@ async def test_browse_nodes(server, client):
     assert isinstance(results[1][0], Node)
     assert isinstance(results[0][1], ua.BrowseResult)
     assert isinstance(results[1][1], ua.BrowseResult)
-    
-    
+
+
+async def test_translate_browsepaths(server, client: Client):
+    server_node = await client.nodes.objects.get_child("Server")
+
+    relative_paths = ["/0:ServiceLevel", "/0:ServerStatus/0:State"]
+    results = await client.translate_browsepaths(server_node.nodeid, relative_paths)
+    assert len(results) == 2
+    assert isinstance(results, list)
+    assert results[0].StatusCode.value == ua.StatusCodes.Good
+    assert results[0].Targets[0].TargetId == ua.NodeId.from_string("ns=0;i=2267")
+    assert results[1].StatusCode.value == ua.StatusCodes.Good
+    assert results[1].Targets[0].TargetId == ua.NodeId.from_string("ns=0;i=2259")
+    for result in results:
+        assert isinstance(result, ua.BrowsePathResult)
+
+    results2 = await client.translate_browsepaths(server_node.nodeid, ["/0:UnknownPath"])
+    assert len(results2) == 1
+    assert isinstance(results2, list)
+    assert results2[0].StatusCode.value == ua.StatusCodes.BadNoMatch
+    assert len(results2[0].Targets) == 0
+
+    with pytest.raises(ua.UaStringParsingError):
+        await client.translate_browsepaths(server_node.nodeid, ["/1:<Boiler"])
+
+
+async def test_strip_credentials_in_url():
+    """Check that the credentials are correctly stripped in the server url"""
+
+    client = Client('opc.tcp://user:password@dummy_address:10000')
+    assert client.server_url.netloc == 'dummy_address:10000'
+
+    client = Client('opc.tcp://user:password@dummy_address:10000')
+    client.strip_url_credentials = False
+    assert client.server_url.netloc == 'user:password@dummy_address:10000'

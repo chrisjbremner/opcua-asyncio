@@ -5,15 +5,16 @@ Simple unit test that do not need to setup a server or a client
 """
 
 import io
-import os
+from pathlib import Path
 import uuid
 import pytest
 import logging
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, cast
 
 from asyncua import ua
+from asyncua.ua import ua_binary
 from asyncua.ua.ua_binary import extensionobject_from_binary
 from asyncua.ua.ua_binary import extensionobject_to_binary
 from asyncua.ua.ua_binary import nodeid_to_binary, variant_to_binary, _reshape, variant_from_binary, nodeid_from_binary
@@ -26,39 +27,46 @@ from asyncua.ua.uatypes import _MaskEnum
 from asyncua.common.structures import StructGenerator
 from asyncua.common.connection import MessageChunk
 
-EXAMPLE_BSD_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "example.bsd"))
+EXAMPLE_BSD_PATH = Path(__file__).parent.absolute() / "example.bsd"
 
 
 def test_variant_array_none():
-    v = ua.Variant(None, VariantType=ua.VariantType.Int32, Dimensions=[0])
+    v = ua.Variant(None, VariantType=ua.VariantType.Int32, is_array=True)
     data = variant_to_binary(v)
     v2 = variant_from_binary(ua.utils.Buffer(data))
     assert v == v2
     assert v2.is_array
-    assert v2.Dimensions == [0]
+    assert v2.Dimensions is None
 
-    v = ua.Variant(None, VariantType=ua.VariantType.Null, Dimensions=[0])
+    v = ua.Variant(None, VariantType=ua.VariantType.Null, is_array=True)
     data = variant_to_binary(v)
     v2 = variant_from_binary(ua.utils.Buffer(data))
     assert v == v2
     assert v2.is_array
-    assert v2.Dimensions == [0]
+    assert v2.Dimensions is None
 
-    v = ua.Variant(None, VariantType=ua.VariantType.Null, Dimensions=None)
+    v = ua.Variant(None, VariantType=ua.VariantType.Null, Dimensions=[0, 0])
     data = variant_to_binary(v)
     v2 = variant_from_binary(ua.utils.Buffer(data))
     assert v == v2
-    assert not v2.is_array
-    assert v2.Dimensions == None
-
+    assert v2.is_array
+    assert v2.Dimensions == [0, 0]
 
 
 def test_variant_empty_list():
-    v = ua.Variant([], VariantType=ua.VariantType.Int32, Dimensions=[0])
+    v = ua.Variant([], VariantType=ua.VariantType.Int32, is_array=True)
     data = variant_to_binary(v)
     v2 = variant_from_binary(ua.utils.Buffer(data))
     assert v == v2
     assert v2.is_array
+    assert v2.Dimensions is None
+
+    v = ua.Variant([], VariantType=ua.VariantType.Int32, is_array=True, Dimensions=[0])
+    data = variant_to_binary(v)
+    v2 = variant_from_binary(ua.utils.Buffer(data))
+    assert v == v2
+    assert v2.is_array
+    assert v2.Dimensions == [0]
 
 
 def test_custom_structs(tmpdir):
@@ -174,6 +182,30 @@ def test_nodeid_ordering():
     assert mylist == expected
 
 
+def test_status_code_severity():
+    good_statuscodes = (ua.StatusCodes.Good, ua.StatusCodes.GoodLocalOverride)
+    bad_statuscodes = (ua.StatusCodes.Bad, ua.StatusCodes.BadConditionDisabled)
+    uncertain_statuscodes = (ua.StatusCodes.Uncertain, ua.StatusCodes.UncertainSimulatedValue)
+
+    for good_statuscode in good_statuscodes:
+        statuscode = ua.StatusCode(good_statuscode)
+        assert statuscode.is_good()
+        assert not statuscode.is_bad()
+        assert not statuscode.is_uncertain()
+
+    for bad_statuscode in bad_statuscodes:
+        statuscode = ua.StatusCode(bad_statuscode)
+        assert not statuscode.is_good()
+        assert statuscode.is_bad()
+        assert not statuscode.is_uncertain()
+
+    for uncertain_statuscode in uncertain_statuscodes:
+        statuscode = ua.StatusCode(uncertain_statuscode)
+        assert not statuscode.is_good()
+        assert not statuscode.is_bad()
+        assert statuscode.is_uncertain()
+
+
 def test_string_to_variant_int():
     s_arr_uint = "[1, 2, 3, 4]"
     arr_uint = [1, 2, 3, 4]
@@ -197,6 +229,11 @@ def test_string_to_variant_datetime_string():
     assert s_arr_datetime == val_to_string(arr_string)
     assert arr_string == string_to_val(s_arr_datetime, ua.VariantType.String)
     assert arr_datetime == string_to_val(s_arr_datetime, ua.VariantType.DateTime)
+
+
+def test_string_not_an_array():
+    s_not_an_array = "[this] is not an array"
+    assert s_not_an_array == string_to_val(s_not_an_array, ua.VariantType.String)
 
 
 def test_string_to_variant_nodeid():
@@ -281,16 +318,16 @@ def test_string_to_val_xml_element():
 
 
 def test_variant_dimensions():
-    l = [[[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]], [[5.0, 5.0, 5.0, 5.0], [7.0, 8.0, 9.0, 01.0], [1.0, 1.0, 1.0, 1.0]]]
-    v = ua.Variant(l)
+    arry = [[[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]], [[5.0, 5.0, 5.0, 5.0], [7.0, 8.0, 9.0, 01.0], [1.0, 1.0, 1.0, 1.0]]]
+    v = ua.Variant(arry)
     assert [2, 3, 4] == v.Dimensions
     v2 = variant_from_binary(ua.utils.Buffer(variant_to_binary(v)))
     assert v == v2
     assert v.Dimensions == v2.Dimensions
 
     # very special case
-    l = [[[], [], []], [[], [], []]]
-    v = ua.Variant(l, ua.VariantType.UInt32)
+    arry = [[[], [], []], [[], [], []]]
+    v = ua.Variant(arry, ua.VariantType.UInt32)
     assert [2, 3, 0] == v.Dimensions
     v2 = variant_from_binary(ua.utils.Buffer(variant_to_binary(v)))
     assert v.Dimensions == v2.Dimensions
@@ -298,25 +335,25 @@ def test_variant_dimensions():
 
 
 def test_flatten():
-    l = [[[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]]
-    l2 = flatten(l)
-    dims = get_shape(l)
+    arry = [[[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]]
+    l2 = flatten(arry)
+    dims = get_shape(arry)
     assert [2, 3, 4] == dims
-    assert l != l2
+    assert arry != l2
 
     l3 = _reshape(l2, (2, 3, 4))
-    assert l == l3
+    assert arry == l3
 
-    l = [[[], [], []], [[], [], []]]
-    l2 = flatten(l)
-    dims = get_shape(l)
+    arry = [[[], [], []], [[], [], []]]
+    l2 = flatten(arry)
+    dims = get_shape(arry)
     assert dims == [2, 3, 0]
 
-    l = [1, 2, 3, 4]
-    l2 = flatten(l)
-    dims = get_shape(l)
+    arry = [1, 2, 3, 4]
+    l2 = flatten(arry)
+    dims = get_shape(arry)
     assert dims == [4]
-    assert l == l2
+    assert arry == l2
 
 
 def test_custom_variant():
@@ -358,6 +395,14 @@ def test_nodeid_bytestring():
     s2 = n2.to_string()
     assert n == n2
     assert s == s2
+    n = ua.ByteStringNodeId(Identifier=b'\x01\x00\x05\x55')
+    s = n.to_string()
+    n2 = ua.NodeId.from_string(s)
+    s2 = n2.to_string()
+    assert n == n2
+    assert s == s2
+    n = ua.NodeId.from_string('b=0xaabbccdd')
+    assert n.Identifier == b'\xaa\xbb\xcc\xdd'
 
 
 def test__nodeid():
@@ -409,6 +454,17 @@ def test_nodeid_string():
     # nid1 = ua.NodeId(7, "myid.mynodeid")
     # with pytest.raises(ua.UaError):
     # nid1 = ua.StringNodeId(1, 2)
+
+
+def test_qualifiedname_string():
+    qname1 = ua.QualifiedName.from_string("Name")
+    assert (0, "Name") == (qname1.NamespaceIndex, qname1.Name)
+    qname2 = ua.QualifiedName.from_string("1:Name")
+    assert (1, "Name") == (qname2.NamespaceIndex, qname2.Name)
+    qname3 = ua.QualifiedName.from_string("Name", default_idx=2)
+    assert (2, "Name") == (qname3.NamespaceIndex, qname3.Name)
+    qname4 = ua.QualifiedName.from_string("3:Name", default_idx=2)
+    assert (3, "Name") == (qname4.NamespaceIndex, qname4.Name)
 
 
 def test_bad_string():
@@ -483,9 +539,9 @@ def test_extension_object():
 
 def test_unknown_extension_object():
     obj = ua.ExtensionObject(
-            Body=b'example of data in custom format',
-            TypeId = ua.NodeId.from_string('ns=3;i=42'),
-            )
+        Body=b'example of data in custom format',
+        TypeId=ua.NodeId.from_string('ns=3;i=42'),
+    )
 
     data = ua.utils.Buffer(extensionobject_to_binary(obj))
     obj2 = extensionobject_from_binary(data)
@@ -512,6 +568,9 @@ def test_datetime():
     assert epch == epch2
     epch = 0
     assert ua.datetime_to_win_epoch(ua.win_epoch_to_datetime(epch)) == epch
+    # Test if values that are out of range are either min or max
+    assert ua.datetime_to_win_epoch(datetime.min) == 0
+    assert ua.datetime_to_win_epoch(datetime.max) == ua.MAX_INT64
 
 
 def test_equal_nodeid():
@@ -553,13 +612,13 @@ def test_numeric_nodeid():
 
 
 def test_qualifiedstring_nodeid():
-    nid = ua.NodeId.from_string('ns=2;s=PLC1.Manufacturer;')
+    nid = ua.NodeId.from_string('ns=2;s=PLC1.Manufacturer')
     assert nid.NamespaceIndex == 2
     assert nid.Identifier == 'PLC1.Manufacturer'
 
 
 def test_strrepr_nodeid():
-    nid = ua.NodeId.from_string('ns=2;s=PLC1.Manufacturer;')
+    nid = ua.NodeId.from_string('ns=2;s=PLC1.Manufacturer')
     assert nid.to_string() == 'ns=2;s=PLC1.Manufacturer'
     # assert repr(nid) == 'ns=2;s=PLC1.Manufacturer;'
 
@@ -582,8 +641,8 @@ def test_datavalue():
 
 def test_variant():
     dv = ua.Variant(True, ua.VariantType.Boolean)
-    assert dv.Value == True
-    assert type(dv.Value) == bool
+    assert dv.Value is True
+    assert isinstance(dv.Value, bool)
     now = datetime.utcnow()
     v = ua.Variant(now)
     assert v.Value == now
@@ -602,6 +661,7 @@ def test_variant_array():
     v2 = variant_from_binary(ua.utils.Buffer(variant_to_binary(v)))
     assert v.Value == v2.Value
     assert v.VariantType == v2.VariantType
+    assert v2.Dimensions is None
 
     now = datetime.utcnow()
     v = ua.Variant([now])
@@ -610,12 +670,16 @@ def test_variant_array():
     v2 = variant_from_binary(ua.utils.Buffer(variant_to_binary(v)))
     assert v.Value == v2.Value
     assert v.VariantType == v2.VariantType
+    assert v2.Dimensions is None
 
 
 def test_variant_array_dim():
     v = ua.Variant([1, 2, 3, 4, 5, 6], Dimensions=[2, 3])
     assert v.Value[1] == 2
+    assert v.Dimensions == [2, 3]
+
     v2 = variant_from_binary(ua.utils.Buffer(variant_to_binary(v)))
+
     assert _reshape(v.Value, (2, 3)) == v2.Value
     assert v.VariantType == v2.VariantType
     assert v.Dimensions == v2.Dimensions
@@ -709,8 +773,7 @@ def test_where_clause():
     op.BrowsePath.append(ua.QualifiedName("property", 2))
     el.FilterOperands.append(op)
     for i in range(10):
-        op = ua.LiteralOperand()
-        op.Value = ua.Variant(i)
+        op = ua.LiteralOperand(Value=ua.Variant(i))
         el.FilterOperands.append(op)
     el.FilterOperator = ua.FilterOperator.InList
     cf.Elements.append(el)
@@ -777,8 +840,7 @@ def test_bin_datattributes():
 
 def test_browse():
     data = b'\x01\x00\x12\x02\xe0S2\xb3\x8f\n\xd7\x01\x04\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x03\x00\x00\x00\x00#\x01@U\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00Objects\x02\x07\x00\x00\x00Objects\x01\x00\x00\x00@=\x00\x00\x00\x00\x00#\x01@V\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00Types\x02\x05\x00\x00\x00Types\x01\x00\x00\x00@=\x00\x00\x00\x00\x00#\x01@W\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00Views\x02\x05\x00\x00\x00Views\x01\x00\x00\x00@=\x00\x00\x00\x00\xff\xff\xff\xff'
-    #data = b'\x01\x00\x12\x020)E\x11"\n\xd7\x01\x04\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\x03\x00\x00\x00\x00#\x01@U\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00Objects\x02\x07\x00\x00\x00Objects\x01\x00\x00\x00@=\x00\x00\x00\x00\x00#\x01@V\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00Types\x02\x05\x00\x00\x00Types\x01\x00\x00\x00@=\x00\x00\x00\x00\x00#\x01@W\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00Views\x02\x05\x00\x00\x00Views\x01\x00\x00\x00@=\x00\x00\x00\x00\xff\xff\xff\xff'
-    res = struct_from_binary(ua.BrowseResponse, ua.utils.Buffer(data))
+    _ = struct_from_binary(ua.BrowseResponse, ua.utils.Buffer(data))
 
 
 def test_bname():
@@ -796,21 +858,21 @@ def test_expandedNodeId():
     assert nid.Identifier == 85
 
 
-def test_struct_104():
+def test_struct_104() -> None:
     @dataclass
     class MyStruct:
         Encoding: ua.Byte = field(default=0, repr=False, init=False)
         a: ua.Int32 = 1
         b: Optional[ua.Int32] = None
         c: Optional[ua.String] = None
-        l: List[ua.String] = None
+        l: List[ua.String] = None  # noqa: E741
 
     m = MyStruct()
     data = struct_to_binary(m)
     m2 = struct_from_binary(MyStruct, ua.utils.Buffer(data))
     assert m == m2
 
-    m = MyStruct(a=4, b=5, c="lkjkæl", l=["a", "b", "c"])
+    m = MyStruct(a=4, b=5, c="lkjkæl", l=[cast(ua.String, "a"), cast(ua.String, "b"), cast(ua.String, "c")])
     data = struct_to_binary(m)
     m2 = struct_from_binary(MyStruct, ua.utils.Buffer(data))
     assert m == m2
@@ -832,3 +894,12 @@ def test_builtin_type_variant():
     assert v.VariantType == ua.VariantType.Byte
     v = ua.Variant(None, ua.String)
     assert v.VariantType == ua.VariantType.String
+
+
+def test_option_set_size():
+    # Test if DataSetFieldFlags is 2 bytes instead of 4 bytes of all other flagfields
+    val = ua.DataSetFieldFlags.PromotedField
+    binary = ua_binary.to_binary(ua.DataSetFieldFlags, val)
+    assert len(binary) == 2
+    val_2 = ua_binary.from_binary(ua.DataSetFieldFlags, ua.utils.Buffer(binary))
+    assert val == val_2

@@ -3,7 +3,7 @@ import asyncio
 import sys
 sys.path.insert(0, "..")
 
-from asyncua import ua, Server
+from asyncua import Server
 from asyncua.common.methods import uamethod
 
 
@@ -28,7 +28,7 @@ async def main():
     await server.init()
     server.set_endpoint('opc.tcp://example-endpoint.freeopcua.github.com:32000/freeopcua/server/')
 
-    # setup our own namespace, not really necessary but should as spec
+    # set up our own namespace, not really necessary but should as spec
     uri = 'http://examples.freeopcua.github.io'
     idx = await server.register_namespace(uri)
 

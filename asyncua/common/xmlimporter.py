@@ -2,27 +2,42 @@
 add nodes defined in XML to address space
 format is the one from opc-ua specification
 """
+from __future__ import annotations
+
 import logging
 import uuid
-from typing import Union, Dict
+from typing import Set, Union, Dict, List, Tuple
 from dataclasses import fields, is_dataclass
-
-from asyncua import ua
-from asyncua.ua.uatypes import type_is_union, type_from_union, type_is_list, type_from_list
+from asyncua.common.structures104 import load_custom_struct_xml_import, load_enum_xml_import, load_basetype_alias_xml_import
+import asyncua
+from asyncua import ua, Node
+from asyncua.ua.uatypes import type_is_union, types_from_union, type_is_list, type_from_list
 from .xmlparser import XMLParser, ua_type_to_python
 from ..ua.uaerrors import UaError
 
 _logger = logging.getLogger(__name__)
 
 
+def _parse_version(version_string: str) -> List[int]:
+    return [int(v) for v in version_string.split('.')]
+
+
 class XmlImporter:
-    def __init__(self, server):
+
+    def __init__(self, server: Union[asyncua.Server, asyncua.Client], strict_mode: bool = True, auto_load_definitions: bool = True):
+        '''
+        strict_mode: stop on an error, if False only an error message is logged,
+                     but the import continues
+        auto_load_definitions: auto generate code stubs on the fly for enum and structs
+        '''
         self.parser = None
-        self.server = server
+        self.session = server
         self.namespaces: Dict[int, int] = {}  # Dict[IndexInXml, IndexInServer]
         self.aliases: Dict[str, ua.NodeId] = {}
-        self._unmigrated_aliases: Dict[str, str] = {} # Dict[name, nodeId string]
+        self._unmigrated_aliases: Dict[str, str] = {}  # Dict[name, nodeId string]
         self.refs = None
+        self.strict_mode = strict_mode
+        self.auto_load_definitions = auto_load_definitions
 
     async def _map_namespaces(self):
         """
@@ -30,14 +45,14 @@ class XmlImporter:
         if not present the namespace is registered.
         """
         xml_uris = self.parser.get_used_namespaces()
-        server_uris = await self.server.get_namespace_array()
+        server_uris = await self.session.get_namespace_array()
         namespaces_map = {}
         for ns_index, ns_uri in enumerate(xml_uris):
             ns_index += 1  # since namespaces start at 1 in xml files
             if ns_uri in server_uris:
                 namespaces_map[ns_index] = server_uris.index(ns_uri)
             else:
-                ns_server_index = await self.server.register_namespace(ns_uri)
+                ns_server_index = await self.session.register_namespace(ns_uri)
                 namespaces_map[ns_index] = ns_server_index
         return namespaces_map
 
@@ -52,7 +67,7 @@ class XmlImporter:
 
     async def _get_existing_model_in_namespace(self):
         server_model_list = []
-        server_namespaces_node = await self.server.nodes.namespaces.get_children()
+        server_namespaces_node = await self.session.nodes.namespaces.get_children()
         for model_node in server_namespaces_node:
             server_model_list.append({
                 "ModelUri": await (await model_node.get_child("NamespaceUri")).read_value(),
@@ -70,7 +85,7 @@ class XmlImporter:
             for req_model in req_models:
                 if (model["ModelUri"] == req_model["ModelUri"] and model["PublicationDate"] >= req_model["PublicationDate"]):
                     if "Version" in model and "Version" in req_model:
-                        if model["Version"] >= req_model["Version"]:
+                        if _parse_version(model["Version"]) >= _parse_version(req_model["Version"]):
                             req_models.remove(req_model)
                     else:
                         req_models.remove(req_model)
@@ -84,6 +99,26 @@ class XmlImporter:
                 )
             raise ValueError("Server doesn't satisfy required XML-Models. Import them first!")
         return None
+
+    async def _check_if_namespace_meta_information_is_added(self):
+        """
+        check if the NamespaceMetadata objects in server namespaces exists otherwise add them
+        to prevent errors when other nodesets depend on this namespace.
+        """
+        descs = await self.session.nodes.namespaces.get_children_descriptions()
+        ns_objs = [n.BrowseName.Name for n in descs]
+        for uri, version, pub_date in self.parser.get_nodeset_namespaces():
+            if uri not in ns_objs:
+                idx = await self.session.register_namespace(uri)
+                obj = await self.session.nodes.namespaces.add_object(idx, uri, ua.ObjectIds.NamespaceMetadataType, False)
+                ns_uri = await obj.get_child('NamespaceUri')
+                await ns_uri.write_value(uri, ua.VariantType.String)
+                ns_ver = await obj.get_child('NamespaceVersion')
+                await ns_ver.write_value(version, ua.VariantType.String)
+                ns_date = await obj.get_child('NamespacePublicationDate')
+                await ns_date.write_value(pub_date)
+                ns_subset = await obj.get_child('IsNamespaceSubset')
+                await ns_subset.write_value(True)
 
     async def import_xml(self, xmlpath=None, xmlstring=None):
         """
@@ -103,15 +138,16 @@ class XmlImporter:
         dnodes = self.parser.get_node_datas()
         dnodes = self.make_objects(dnodes)
         self._add_missing_parents(dnodes)
-        nodes_parsed = self._sort_nodes_by_parentid(dnodes)
+        nodes_parsed = self._sort_nodes(dnodes)
         nodes = []
         for nodedata in nodes_parsed:  # self.parser:
             try:
                 node = await self._add_node_data(nodedata, no_namespace_migration=True)
-            except Exception:
-                _logger.warning("failure adding node %s", nodedata)
-                raise
-            nodes.append(node)
+                nodes.append(node)
+            except Exception as e:
+                _logger.warning("failure adding node %s %s", nodedata, e)
+                if self.strict_mode:
+                    raise
         self.refs, remaining_refs = [], self.refs
         await self._add_references(remaining_refs)
         missing_nodes = await self._add_missing_reverse_references(nodes)
@@ -122,34 +158,53 @@ class XmlImporter:
                 "The following references could not be imported and are probably broken: %s",
                 self.refs,
             )
+        await self._check_if_namespace_meta_information_is_added()
         return nodes
 
-    async def _add_missing_reverse_references(self, new_nodes):
+    async def _add_missing_reverse_references(self, new_nodes: List[Node]) -> Set[Node]:
         __unidirectional_types = {ua.ObjectIds.GuardVariableType, ua.ObjectIds.HasGuard,
                                   ua.ObjectIds.TransitionVariableType, ua.ObjectIds.StateMachineType,
                                   ua.ObjectIds.StateVariableType, ua.ObjectIds.TwoStateVariableType,
                                   ua.ObjectIds.StateType, ua.ObjectIds.TransitionType,
                                   ua.ObjectIds.FiniteTransitionVariableType, ua.ObjectIds.HasInterface}
-        dangling_refs_to_missing_nodes = set()
+        dangling_refs_to_missing_nodes = set(new_nodes)
+
+        RefSpecKey = Tuple[ua.NodeId, ua.NodeId, ua.NodeId]  # (source_node_id, target_node_id, ref_type_id)
+        node_reference_map: Dict[RefSpecKey, ua.ReferenceDescription] = {}
+
         for new_node_id in new_nodes:
-            new_n = self.server.get_node(new_node_id)
-            new_n_refs = await new_n.get_references()
-            if len(new_n_refs) == 0:
-                _logger.warning("Node %s has no references, so it does not exist in Server!", new_node_id)
-                continue
-            for ref in new_n_refs:
-                if ref.ReferenceTypeId not in __unidirectional_types:
-                    n = self.server.get_node(ref.NodeId)
-                    n_refs = await n.get_references()
-                    if len(n_refs) == 0:
-                        _logger.warning("Node %s has no references, so it does not exist in Server!", ref.NodeId)
-                        dangling_refs_to_missing_nodes.add(ref.NodeId)
-                        continue
-                    for n_ref in n_refs:
-                        if new_node_id == n_ref.NodeId and n_ref.ReferenceTypeId == ref.ReferenceTypeId:
-                            break
-                    else:
-                        await n.add_reference(new_node_id, ref.ReferenceTypeId, not ref.IsForward)
+            node = self.session.get_node(new_node_id)
+            node_ref_list: List[ua.ReferenceDescription] = await node.get_references()
+
+            for ref in node_ref_list:
+                dangling_refs_to_missing_nodes.discard(new_node_id)
+                dangling_refs_to_missing_nodes.discard(ref.NodeId)
+
+                if ref.ReferenceTypeId.NamespaceIndex != 0 or ref.ReferenceTypeId.Identifier not in __unidirectional_types:
+                    ref_key: RefSpecKey = (new_node_id, ref.NodeId, ref.ReferenceTypeId)
+                    node_reference_map[ref_key] = ref
+
+        for node in dangling_refs_to_missing_nodes:
+            _logger.warning("Node %s has no references, so it does not exist in Server!", node)
+
+        reference_fixes = []
+
+        for ref_spec, ref in node_reference_map.items():
+            source_node_id, target_node_id, ref_type = ref_spec
+            reverse_ref_spec = (target_node_id, source_node_id, ref_type)
+            if reverse_ref_spec not in node_reference_map:
+
+                _logger.debug("Adding missing reference: %s <-> %s (%s)", target_node_id, source_node_id, ref.ReferenceTypeId)
+
+                new_ref = ua.AddReferencesItem(
+                    SourceNodeId=target_node_id,
+                    TargetNodeId=source_node_id,
+                    ReferenceTypeId=ref_type,
+                    IsForward=(not ref.IsForward)
+                )
+                reference_fixes.append(new_ref)
+        await self._add_references(reference_fixes)
+
         return dangling_refs_to_missing_nodes
 
     def _add_missing_parents(self, dnodes):
@@ -161,8 +216,8 @@ class XmlImporter:
             for ref in nd.refs:
                 if ref.forward:
                     if ref.reftype in [
-                            self.server.nodes.HasComponent.nodeid,
-                            self.server.nodes.HasProperty.nodeid]:
+                            self.session.nodes.HasComponent.nodeid,
+                            self.session.nodes.HasProperty.nodeid]:
                         # if a node has several links, the last one will win
                         if ref.target in childs:
                             _logger.warning(
@@ -199,9 +254,9 @@ class XmlImporter:
         return node
 
     def _get_server(self):
-        if hasattr(self.server, "iserver"):
-            return self.server.iserver.isession
-        return self.server.uaclient
+        if hasattr(self.session, "iserver"):
+            return self.session.iserver.isession
+        return self.session.uaclient
 
     async def _add_references(self, refs):
         res = await self._get_server().add_references(refs)
@@ -235,7 +290,7 @@ class XmlImporter:
     def _migrate_ns(self, obj: Union[ua.NodeId, ua.QualifiedName]) -> Union[ua.NodeId, ua.QualifiedName]:
         """
         Check if the index of nodeid or browsename  given in the xml model file
-        must be converted to a already existing namespace id based on the files
+        must be converted to an already existing namespace id based on the files
         namespace uri
 
         :returns: NodeId (str)
@@ -275,7 +330,7 @@ class XmlImporter:
             node.RequestedNewNodeId)
         return node
 
-    def _to_migrated_nodeid(self, nodeid: Union[ua.NodeId, None, str]) -> ua.NodeId:
+    def _to_migrated_nodeid(self, nodeid: Union[ua.NodeId, None, str]) -> Union[ua.NodeId, ua.QualifiedName]:
         nodeid = self._to_nodeid(nodeid)
         return self._migrate_ns(nodeid)
 
@@ -302,7 +357,9 @@ class XmlImporter:
         node.NodeAttributes = attrs
         res = await self._get_server().add_nodes([node])
         await self._add_refs(obj)
-        res[0].StatusCode.check()
+        # do not verify these nodes because some nodesets contain invalid elements
+        if obj.displayname != 'Default Binary' and obj.displayname != 'Default XML' and obj.displayname != 'Default Json':
+            res[0].StatusCode.check()
         return res[0].AddedNodeId
 
     async def add_object_type(self, obj, no_namespace_migration=False):
@@ -324,9 +381,10 @@ class XmlImporter:
         if obj.desc:
             attrs.Description = ua.LocalizedText(obj.desc)
         attrs.DisplayName = ua.LocalizedText(obj.displayname)
-        attrs.DataType = obj.datatype
+        if obj.datatype is not None:
+            attrs.DataType = obj.datatype
         if obj.value is not None:
-            attrs.Value = self._add_variable_value(obj, )
+            attrs.Value = await self._add_variable_value(obj, )
         if obj.rank:
             attrs.ValueRank = obj.rank
         if obj.accesslevel:
@@ -354,8 +412,15 @@ class XmlImporter:
             raise Exception("Error no extension class registered ", name, nodeid)
         raise Exception("Error no alias found for extension class", name)
 
-    def _make_ext_obj(self, obj):
-        extclass = self._get_ext_class(obj.objname)
+    async def _make_ext_obj(self, obj):
+        try:
+            extclass = self._get_ext_class(obj.objname)
+        except Exception as exp:
+            if self.auto_load_definitions:
+                await self.session.load_data_type_definitions()      # load new data type definitions since a customn class should be created
+                extclass = self._get_ext_class(obj.objname)
+            else:
+                raise exp
         args = {}
         for name, val in obj.body:
             if not isinstance(val, list):
@@ -366,8 +431,10 @@ class XmlImporter:
                     val,
                 )
             for attname, v in val:
-                atttype = self._get_val_type(extclass, attname)
-                self._set_attr(atttype, args, attname, v)
+                if attname != 'EncodingMask':
+                    # Skip Encoding Mask used for optional types
+                    atttype = self._get_val_type(extclass, attname)
+                    self._set_attr(atttype, args, attname, v)
         return extclass(**args)
 
     def _get_val_type(self, objclass, attname: str):
@@ -381,7 +448,7 @@ class XmlImporter:
         # either we get value directly
         # or a dict if it s an object or a list
         if type_is_union(atttype):
-            atttype = type_from_union(atttype)
+            atttype = types_from_union(atttype)[0]
         if isinstance(val, str):
             pval = ua_type_to_python(val, atttype.__name__)
             fargs[attname] = pval
@@ -391,7 +458,10 @@ class XmlImporter:
             atttype = type_from_list(atttype)
             my_list = []
             for vtype, v2 in val:
-                my_list.append(ua_type_to_python(v2, vtype))
+                if isinstance(v2, str):
+                    my_list.append(ua_type_to_python(v2, vtype))
+                else:
+                    my_list.append(v2)
             fargs[attname] = my_list
 
         elif issubclass(atttype, ua.NodeId):  # NodeId representation does not follow common rules!!
@@ -406,15 +476,17 @@ class XmlImporter:
         elif is_dataclass(atttype):
             subargs = {}
             for attname2, v2 in val:
-                sub_atttype = self._get_val_type(atttype, attname2)
-                self._set_attr(sub_atttype, subargs, attname2, v2)
+                if attname2 != 'EncodingMask':
+                    # Skip Encoding Mask used for optional types
+                    sub_atttype = self._get_val_type(atttype, attname2)
+                    self._set_attr(sub_atttype, subargs, attname2, v2)
             if "Encoding" in subargs:
                 del subargs["Encoding"]
             fargs[attname] = atttype(**subargs)
         else:
             raise RuntimeError(f"Could not handle type {atttype} of type {type(atttype)}")
 
-    def _add_variable_value(self, obj):
+    async def _add_variable_value(self, obj):
         """
         Returns the value for a Variable based on the objects value type.
         """
@@ -422,7 +494,7 @@ class XmlImporter:
         if obj.valuetype == "ListOfExtensionObject":
             values = []
             for ext in obj.value:
-                extobj = self._make_ext_obj(ext)
+                extobj = await self._make_ext_obj(ext)
                 values.append(extobj)
             return ua.Variant(values, ua.VariantType.ExtensionObject)
         if obj.valuetype == "ListOfGuid":
@@ -433,9 +505,11 @@ class XmlImporter:
                 return ua.Variant(obj.value, getattr(ua.VariantType, vtype))
             if vtype == "LocalizedText":
                 return ua.Variant([ua.LocalizedText(Text=item["Text"], Locale=item["Locale"]) for item in obj.value])
+            if vtype in ["ExpandedNodeId", "QualifiedName", "XmlElement", "StatusCode"]:
+                return ua.Variant(obj.value)
             return ua.Variant([getattr(ua, vtype)(v) for v in obj.value])
         if obj.valuetype == "ExtensionObject":
-            extobj = self._make_ext_obj(obj.value)
+            extobj = await self._make_ext_obj(obj.value)
             return ua.Variant(extobj, getattr(ua.VariantType, obj.valuetype))
         if obj.valuetype == "Guid":
             return ua.Variant(uuid.UUID(obj.value), getattr(ua.VariantType, obj.valuetype))
@@ -455,13 +529,16 @@ class XmlImporter:
         if obj.desc:
             attrs.Description = ua.LocalizedText(obj.desc)
         attrs.DisplayName = ua.LocalizedText(obj.displayname)
-        attrs.DataType = obj.datatype
-        if obj.value and len(obj.value) == 1:
-            attrs.Value = obj.value[0]
+        if obj.datatype is not None:
+            attrs.DataType = obj.datatype
+        if obj.value:
+            attrs.Value = await self._add_variable_value(obj, )
         if obj.rank:
             attrs.ValueRank = obj.rank
         if obj.abstract:
             attrs.IsAbstract = obj.abstract
+        else:
+            attrs.IsAbstract = False
         if obj.dimensions:
             attrs.ArrayDimensions = obj.dimensions
         node.NodeAttributes = attrs
@@ -500,6 +577,8 @@ class XmlImporter:
             attrs.InverseName = ua.LocalizedText(obj.inversename)
         if obj.abstract:
             attrs.IsAbstract = obj.abstract
+        else:
+            attrs.IsAbstract = False
         if obj.symmetric:
             attrs.Symmetric = obj.symmetric
         node.NodeAttributes = attrs
@@ -509,6 +588,10 @@ class XmlImporter:
         return res[0].AddedNodeId
 
     async def add_datatype(self, obj, no_namespace_migration=False):
+        is_enum = False
+        is_struct = False
+        is_option_set = False
+        is_alias = False
         node = self._get_add_node_item(obj, no_namespace_migration)
         attrs = ua.DataTypeAttributes()
         if obj.desc:
@@ -516,18 +599,28 @@ class XmlImporter:
         attrs.DisplayName = ua.LocalizedText(obj.displayname)
         if obj.abstract:
             attrs.IsAbstract = obj.abstract
-        if not obj.definitions:
-            pass
         else:
-            if obj.parent == self.server.nodes.enum_data_type.nodeid:
+            attrs.IsAbstract = False
+        if not obj.definitions:
+            is_alias = True
+        else:
+            if obj.parent == self.session.nodes.enum_data_type.nodeid:
                 attrs.DataTypeDefinition = self._get_edef(obj)
-            elif obj.parent == self.server.nodes.base_structure_type.nodeid:
+                is_enum = True
+            elif obj.parent == self.session.nodes.base_structure_type.nodeid:
                 attrs.DataTypeDefinition = self._get_sdef(obj)
+                is_struct = True
             else:
-                parent_node = self.server.get_node(obj.parent)
+                parent_node = self.session.get_node(obj.parent)
                 path = await parent_node.get_path()
-                if self.server.nodes.base_structure_type in path:
+                if self.session.nodes.option_set_type in path:
+                    # nodes below option_set_type are enums, not structs
+                    attrs.DataTypeDefinition = self._get_edef(obj)
+                    is_enum = True
+                    is_option_set = True
+                elif self.session.nodes.base_structure_type in path:
                     attrs.DataTypeDefinition = self._get_sdef(obj)
+                    is_struct = True
                 else:
                     _logger.warning(
                         "%s has datatypedefinition and path %s"
@@ -539,6 +632,14 @@ class XmlImporter:
         res = await self._get_server().add_nodes([node])
         res[0].StatusCode.check()
         await self._add_refs(obj)
+        if self.auto_load_definitions:
+            if is_struct:
+                await load_custom_struct_xml_import(node.RequestedNewNodeId, attrs)
+            if is_enum:
+                await load_enum_xml_import(node.RequestedNewNodeId, attrs, is_option_set)
+            if is_alias:
+                if node.ParentNodeId != ua.NodeId(ua.ObjectIds.Structure):
+                    await load_basetype_alias_xml_import(self.session, node.BrowseName.Name, node.RequestedNewNodeId, node.ParentNodeId)
         return res[0].AddedNodeId
 
     async def _add_refs(self, obj):
@@ -577,7 +678,7 @@ class XmlImporter:
         if obj.parent:
             sdef.BaseDataType = obj.parent
         for refdata in obj.refs:
-            if refdata.reftype == self.server.nodes.HasEncoding.nodeid:
+            if refdata.reftype == self.session.nodes.HasEncoding.nodeid:
                 # supposing that default encoding is the first one...
                 sdef.DefaultEncodingId = refdata.target
                 break
@@ -588,40 +689,60 @@ class XmlImporter:
             f.DataType = field.datatype
             f.ValueRank = field.valuerank
             f.IsOptional = field.optional
+            f.MaxStringLength = field.max_str_len
             if f.IsOptional:
                 optional = True
-            f.ArrayDimensions = field.arraydim
+            if field.arraydim is None:
+                f.ArrayDimensions = field.arraydim
+            else:
+                f.ArrayDimensions = [int(i) for i in field.arraydim.split(",")]
             f.Description = ua.LocalizedText(Text=field.desc)
             sdef.Fields.append(f)
-        if optional:
+        if obj.struct_type == "IsUnion":
+            sdef.StructureType = ua.StructureType.Union
+        elif optional or obj.struct_type == "IsOptional":
             sdef.StructureType = ua.StructureType.StructureWithOptionalFields
         else:
             sdef.StructureType = ua.StructureType.Structure
         return sdef
 
-    def _sort_nodes_by_parentid(self, ndatas):
+    def _sort_nodes(self, ndatas):
         """
         Sort the list of nodes according their parent node in order to respect
-        the dependency between nodes.
+        the dependency between nodes. Also respect the datatypes used in variables
 
         :param nodes: list of NodeDataObjects
         :returns: list of sorted nodes
         """
 
         sorted_ndatas = []
-        sorted_nodes_ids = []
-        all_node_ids = [data.nodeid for data in ndatas]
-        while ndatas:
-            for ndata in ndatas[:]:
-                if (ndata.nodeid.NamespaceIndex not in self.namespaces.values() or ndata.parent is None or ndata.parent not in all_node_ids):
-                    sorted_ndatas.append(ndata)
-                    sorted_nodes_ids.append(ndata.nodeid)
-                    ndatas.remove(ndata)
+        all_nodes = {data.nodeid: data for data in ndatas}
+        sorted_nodes = {}
+
+        def add_to_sorted(nid, ndata):
+            # check if a node is a datatype, if fields are imported already
+            for field in ndata.definitions:
+                if field.datatype != nid and field.datatype in all_nodes:
+                    if field.datatype not in sorted_nodes:
+                        return
+            sorted_ndatas.append(ndata)
+            sorted_nodes[nid] = ndata
+        last_len = 0
+        while len(sorted_nodes) < len(ndatas):
+            for nid, ndata in all_nodes.items():
+                if nid in sorted_nodes:
+                    continue
+                if ndata.datatype is not None and ndata.datatype in all_nodes:
+                    if ndata.datatype not in sorted_nodes:
+                        continue
+                if (ndata.parent is None or ndata.parent not in all_nodes):
+                    add_to_sorted(nid, ndata)
                 else:
                     # Check if the nodes parent is already in the list of
                     # inserted nodes
-                    if ndata.parent in sorted_nodes_ids:
-                        sorted_ndatas.append(ndata)
-                        sorted_nodes_ids.append(ndata.nodeid)
-                        ndatas.remove(ndata)
+                    if ndata.parent in sorted_nodes:
+                        add_to_sorted(nid, ndata)
+            if last_len == len(sorted_nodes):
+                # When no change is found we are in a endlessloop
+                raise ValueError('Ordering of nodes is not possible')
         return sorted_ndatas

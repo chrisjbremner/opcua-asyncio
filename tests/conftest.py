@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 import operator
-import os
+from pathlib import Path
 import socket
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Process, Condition, Event
@@ -11,6 +11,7 @@ from contextlib import closing
 
 from asyncua import Client
 from asyncua import Server, ua
+from asyncua.client.ua_client import UASocketProtocol
 from asyncua.client.ha.ha_client import HaClient, HaConfig, HaMode
 from asyncua.server.history import HistoryDict
 from asyncua.server.history_sql import HistorySQLite
@@ -18,14 +19,11 @@ from asyncua.server.history_sql import HistorySQLite
 from .test_common import add_server_methods
 from .util_enum_struct import add_server_custom_enum_struct
 
-
-
-
-
 RETRY = 20
 SLEEP = 0.4
 PORTS_USED = set()
-Opc = namedtuple('opc', ['opc', 'server'])
+Opc = namedtuple('Opc', ['opc', 'server'])
+
 
 def find_free_port():
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
@@ -37,6 +35,7 @@ def find_free_port():
             return port
         else:
             return find_free_port()
+
 
 port_num = find_free_port()
 port_num1 = find_free_port()
@@ -90,7 +89,7 @@ class ServerProcess(Process):
 
     async def wait_for_start(self):
         with ThreadPoolExecutor() as pool:
-            result = await asyncio.get_running_loop().run_in_executor(pool, self.wait_for_start_sync)
+            await asyncio.get_running_loop().run_in_executor(pool, self.wait_for_start_sync)
 
     def wait_for_start_sync(self):
         with self.cond:
@@ -265,21 +264,22 @@ async def history_server(request):
         yield srv
         await srv.srv.stop()
 
+
 @pytest.fixture(scope="session")
 def client_key_and_cert(request):
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    cert_dir = os.path.join(base_dir, "examples/certificates") + os.sep
-    key = f"{cert_dir}peer-private-key-example-1.pem"
-    cert = f"{cert_dir}peer-certificate-example-1.der"
+    base_dir = Path(__file__).parent.parent
+    cert_dir = base_dir / "examples/certificates"
+    key = cert_dir / "peer-private-key-example-1.pem"
+    cert = cert_dir / "peer-certificate-example-1.der"
     return key, cert
 
 
 @pytest.fixture(scope="session")
 def server_key_and_cert(request):
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    cert_dir = os.path.join(base_dir, "examples") + os.sep
-    key = f"{cert_dir}private-key-example.pem"
-    cert = f"{cert_dir}certificate-example.der"
+    base_dir = Path(__file__).parent.parent
+    cert_dir = base_dir / "examples"
+    key = cert_dir / "private-key-example.pem"
+    cert = cert_dir / "certificate-example.der"
     return key, cert
 
 
@@ -389,10 +389,18 @@ async def ha_client(ha_config, ha_servers):
 async def wait_clients_socket(ha_client, state):
     for client in ha_client.get_clients():
         for _ in range(RETRY):
-            if client.uaclient.protocol and client.uaclient.protocol.state == state:
+            if state == UASocketProtocol.CLOSED and not client.uaclient.protocol:
                 break
+            if client.uaclient.protocol and client.uaclient.protocol.state == state:
+                # for connection OPEN, also wait for the session to be established
+                # otherwise we can encounter failure on disconnect
+                if state == UASocketProtocol.OPEN:
+                    if client._renew_channel_task:
+                        break
+                else:
+                    break
             await sleep(SLEEP)
-        assert client.uaclient.protocol.state == state
+        assert (not client.uaclient.protocol and state == UASocketProtocol.CLOSED) or client.uaclient.protocol.state == state
 
 
 async def wait_sub_in_real_map(ha_client, sub, negation=False):

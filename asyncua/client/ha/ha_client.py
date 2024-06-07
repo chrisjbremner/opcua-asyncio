@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from functools import partial
 from itertools import chain
-from sortedcontainers import SortedDict
+from sortedcontainers import SortedDict  # type: ignore
 from asyncua import Node, ua, Client
 from asyncua.client.ua_client import UASocketProtocol
 from asyncua.ua.uaerrors import BadSessionClosed, BadSessionNotActivated
@@ -116,9 +116,8 @@ class HaClient:
         self._reconciliator_task: Dict[Reconciliator, asyncio.Task] = {}
         self._gen_sub: Generator[str, None, None] = self.generate_sub_name()
 
-        # The locks must be created in async method!
-        # caling get_running_loop just to make sure we crash if not called in async method
-        self._url_to_reset_lock = asyncio.Lock(loop=asyncio.get_running_loop())
+        # An event loop must be set in the current thread
+        self._url_to_reset_lock = asyncio.Lock()
         self._ideal_map_lock: asyncio.Lock = asyncio.Lock()
         self._client_lock: asyncio.Lock = asyncio.Lock()
 
@@ -240,12 +239,13 @@ class HaClient:
     ) -> None:
 
         async with self._ideal_map_lock:
-            nodes = [n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes]
+            # FIXME: nodeid can be None
+            nodes = [n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes]  # type: ignore[union-attr]
             for url in self.urls:
                 vs = self.ideal_map[url].get(sub_name)
                 if not vs:
                     _logger.warning(
-                        f"The subscription specified for the data_change: {sub_name} doesn't exist in ideal_map"
+                        "The subscription specified for the data_change: %s doesn't exist in ideal_map", sub_name
                     )
                     return
                 vs.subscribe_data_change(nodes, attr, queuesize)
@@ -261,7 +261,7 @@ class HaClient:
                         self.ideal_map[url].pop(sub_name)
                     else:
                         _logger.warning(
-                            f"No subscription named {sub_name} in ideal_map"
+                            "No subscription named %s in ideal_map", sub_name
                         )
                 self.sub_names.remove(sub_name)
 
@@ -287,8 +287,9 @@ class HaClient:
             sub_to_nodes = {}
             first_url = self.urls[0]
             for sub_name, vs in self.ideal_map[first_url].items():
+                # FIXME: nodeid can be None
                 node_set = {
-                    n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes
+                    n.nodeid.to_string() if isinstance(n, Node) else n for n in nodes  # type: ignore[union-attr]
                 }
                 to_del = node_set & vs.get_nodes()
                 if to_del:
@@ -446,30 +447,41 @@ class KeepAlive:
         await asyncio.sleep(3)
         self.is_running = True
         _logger.info(
-            f"Starting keepalive loop for {server_info.url}, checking every {self.timer}sec"
+            "Starting keepalive loop for %s, checking every %dsec", server_info.url, self.timer
         )
         while self.is_running:
-            try:
-                status, slevel = await client.read_values([status_node, slevel_node])
-                if status != ua.ServerState.Running:
-                    _logger.info("ServerState is not running")
+            if client.uaclient.protocol is None:
+                server_info.status = ConnectionStates.NO_DATA
+                _logger.info("No active client")
+            else:
+                try:
+                    status, slevel = await client.read_values([status_node, slevel_node])
+                    if status != ua.ServerState.Running:
+                        _logger.info("ServerState is not running")
+                        server_info.status = ConnectionStates.NO_DATA
+                    else:
+                        server_info.status = slevel
+                except BadSessionNotActivated:
+                    _logger.warning("Session is not yet activated.")
                     server_info.status = ConnectionStates.NO_DATA
-                else:
-                    server_info.status = slevel
-            except BadSessionNotActivated:
-                _logger.warning("Session is not yet activated.")
-                server_info.status = ConnectionStates.NO_DATA
-            except BadSessionClosed:
-                _logger.warning("Session is closed.")
-                server_info.status = ConnectionStates.NO_DATA
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                _logger.warning("Timeout when fetching state")
-                server_info.status = ConnectionStates.NO_DATA
-            except Exception:
-                _logger.exception("Unknown exception during keepalive liveness check")
-                server_info.status = ConnectionStates.NO_DATA
+                except BadSessionClosed :
+                    _logger.warning("Session is closed.")
+                    server_info.status = ConnectionStates.NO_DATA
+                except ConnectionError :
+                    _logger.warning("No connection.")
+                    server_info.status = ConnectionStates.NO_DATA
+                except asyncio.TimeoutError:
+                    _logger.warning("Timeout when fetching state")
+                    server_info.status = ConnectionStates.NO_DATA
+                except asyncio.CancelledError:
+                    _logger.warning("CancelledError, this means we should shutdown")
+                    server_info.status = ConnectionStates.NO_DATA
+                    # FIXME: It cannot be correct to catch CancelledError here, we should re-raise
+                except Exception:
+                    _logger.exception("Unknown exception during keepalive liveness check")
+                    server_info.status = ConnectionStates.NO_DATA
 
-            _logger.info(f"ServiceLevel for {server_info.url}: {server_info.status}")
+            _logger.info("ServiceLevel for %s: %s", server_info.url, server_info.status)
             if await event_wait(self.stop_event, self.timer):
                 self.is_running = False
                 break
@@ -499,7 +511,7 @@ class HaManager:
         reconnect = getattr(self, reco_func)
         self.is_running = True
 
-        _logger.info(f"Starting HaManager loop, checking every {self.timer}sec")
+        _logger.info("Starting HaManager loop, checking every %dsec", self.timer)
         while self.is_running:
 
             # failover happens here
@@ -523,7 +535,7 @@ class HaManager:
         if primary_client != active_client:
             # disable monitoring and reporting when the service_level goes below 200
             _logger.info(
-                f"Failing over active client from {active_client} to {primary_client}"
+                "Failing over active client from %s to %s", active_client, primary_client
             )
             secondaries = (
                 set(clients) - {primary_client} if primary_client else set(clients)
@@ -545,12 +557,12 @@ class HaManager:
                 or client.uaclient.protocol
                 and client.uaclient.protocol.state == UASocketProtocol.CLOSED
             ):
-                _logger.info(f"Virtually reconnecting and resubscribing {client}")
+                _logger.info("Virtually reconnecting and resubscribing %s", client)
                 await self.ha_client.reconnect(client=client)
 
         def log_exception(client: Client, fut: asyncio.Task):
             if fut.exception():
-                _logger.warning(f"Error when reconnecting {client}: {fut.exception()}")
+                _logger.warning("Error when reconnecting %s: %s", client, fut.exception())
 
         tasks = []
         for client in healthy:

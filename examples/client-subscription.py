@@ -1,6 +1,5 @@
 import sys
 sys.path.insert(0, "..")
-import os
 # os.environ['PYOPCUA_NO_TYPO_CHECK'] = 'True'
 
 import asyncio
@@ -31,7 +30,7 @@ async def main():
     client = Client(url='opc.tcp://localhost:4840/freeopcua/server/')
     async with client:
         idx = await client.get_namespace_index(uri="http://examples.freeopcua.github.io")
-        var = await client.nodes.objects.get_child([f"{idx}:MyObject", f"{idx}:MyVariable"])
+        var = await client.nodes.objects.get_child(f"{idx}:MyObject/{idx}:MyVariable")
         handler = SubscriptionHandler()
         # We create a Client Subscription.
         subscription = await client.create_subscription(500, handler)

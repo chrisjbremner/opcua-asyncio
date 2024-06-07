@@ -3,7 +3,7 @@ from asyncua.common.callback import CallbackType
 import logging
 import pytest
 
-_logger = logging.getLogger()
+_logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.asyncio
 
 port_num = 48560
@@ -84,5 +84,4 @@ async def test_write_callback(mocker):
         await var.set_value(69.0)
         assert mocked_write_items.called
     await server.delete_nodes([myobj, myvar])
-
-
+    await server.stop()

@@ -9,9 +9,11 @@ Part 5: Information Model - Annex C (normative) File Transfer
 https://reference.opcfoundation.org/Core/docs/Part5/C.1/
 """
 import logging
+from typing import Tuple
 
 from asyncua.common.node import Node
-from asyncua.ua import NodeId, OpenFileMode, Variant, VariantType 
+from asyncua.ua import NodeId, OpenFileMode, Variant, VariantType
+
 
 _logger = logging.getLogger(__name__)
 
@@ -28,7 +30,7 @@ class UaFile:
         """
         self._file_node = file_node
         self._open_mode = open_mode
-        
+
         self._file_handle = None
         self._read_node = None
         self._write_node = None
@@ -89,7 +91,7 @@ class UaFile:
         It is server-dependent whether the written data are persistently
         stored if the session is ended without calling the Close Method with the fileHandle.
         Writing an empty or null ByteString returns a Good result code without any
-        affect on the file.
+        effect on the file.
         """
         _logger.debug("Request to write to file %s", self._file_node)
         if self._write_node is None:
@@ -194,7 +196,7 @@ class UaDirectory:
         arg1_directory_name = Variant(directory_name, VariantType.String)
         return await self._directory_node.call_method(create_directory_node, arg1_directory_name)
 
-    async def create_file(self, file_name: str, request_file_open: bool) -> [NodeId, int]:
+    async def create_file(self, file_name: str, request_file_open: bool) -> Tuple[NodeId, int]:
         """
         CreateFile is used to create a new FileType Object organized by this Object.
         The created file can be written using the Write Method of the FileType.

@@ -7,13 +7,16 @@ from collections import defaultdict
 from dataclasses import astuple
 from enum import Enum
 from functools import partial
-from typing import TYPE_CHECKING, Dict, Set, Union, List, Optional
-from sortedcontainers import SortedDict
+from typing import TYPE_CHECKING, Dict, Set, Union, List
+from sortedcontainers import SortedDict  # type: ignore
 from asyncua import ua, Client
 from pickle import PicklingError
 
 from .common import batch, event_wait, get_digest
 from .virtual_subscription import VirtualSubscription
+
+if TYPE_CHECKING:
+    from asyncua.sync import Subscription
 
 
 _logger = logging.getLogger(__name__)
@@ -54,7 +57,9 @@ class Reconciliator:
         self.timer = timer
         self.ha_client = ha_client
         self.is_running = False
-        self.stop_event = asyncio.Event(loop=asyncio.get_running_loop())
+
+        # An event loop must be set in the current thread
+        self.stop_event = asyncio.Event()
 
         self.real_map: Dict[str, SortedDict] = {}
         for url in self.ha_client.urls:
@@ -79,7 +84,7 @@ class Reconciliator:
             setattr(self, hook, lambda **kwargs: None)
 
     async def run(self) -> None:
-        _logger.info(f"Starting Reconciliator loop, checking every {self.timer}sec")
+        _logger.info("Starting Reconciliator loop, checking every %dsec", self.timer)
         self.is_running = True
         while self.is_running:
 
@@ -90,7 +95,7 @@ class Reconciliator:
                 await self.reconciliate()
             await self.debug_status()
             stop = time.time() - start
-            _logger.info(f"[TIME] Reconciliation: {stop:.2f}sec")
+            _logger.info("[TIME] Reconciliation: %.2fsec", stop)
 
             if await event_wait(self.stop_event, self.timer):
                 self.is_running = False
@@ -149,14 +154,14 @@ class Reconciliator:
                     targets.add(url)
             if not targets:
                 _logger.info(
-                    f"[PASS] No configuration difference for healthy targets: {valid_urls}"
+                    "[PASS] No configuration difference for healthy targets: %s", valid_urls
                 )
                 return
             _logger.info(
-                f"[WORK] Configuration difference found for healthy targets: {targets}"
+                "[WORK] Configuration difference found for healthy targets: %s", targets
             )
         except (AttributeError, TypeError, PicklingError) as e:
-            _logger.warning(f"[WORK] Reconciliator performance impacted: {e}")
+            _logger.warning("[WORK] Reconciliator performance impacted: %s", e)
             targets = set(valid_urls)
         # add missing and delete unsubscribed subs
         await self.update_subscriptions(real_map, ideal_map, targets)
@@ -177,11 +182,11 @@ class Reconciliator:
 
     def _subs_to_del(
         self, url: str, real_map: SubMap, ideal_map: SubMap
-    ) -> List[Optional[asyncio.Task]]:
-        to_del = []
+    ) -> List[asyncio.Task]:
+        to_del: List[asyncio.Task] = []
         sub_to_del = set(real_map[url]) - set(ideal_map[url])
         if sub_to_del:
-            _logger.info(f"Removing {len(sub_to_del)} subscriptions")
+            _logger.info("Removing %d subscriptions", len(sub_to_del))
         for sub_name in sub_to_del:
             sub_handle = self.name_to_subscription[url][sub_name]
             task = asyncio.create_task(sub_handle.delete())
@@ -193,11 +198,11 @@ class Reconciliator:
 
     def _subs_to_add(
         self, url: str, real_map: SubMap, ideal_map: SubMap
-    ) -> List[Optional[asyncio.Task]]:
-        to_add = []
+    ) -> List[asyncio.Task]:
+        to_add: List[asyncio.Task] = []
         sub_to_add = set(ideal_map[url]) - set(real_map[url])
         if sub_to_add:
-            _logger.info(f"Adding {len(sub_to_add)} subscriptions")
+            _logger.info("Adding %d subscriptions", len(sub_to_add))
         client = self.ha_client.get_client_by_url(url)
         for sub_name in sub_to_add:
             vs = ideal_map[url][sub_name]
@@ -233,8 +238,8 @@ class Reconciliator:
                 # in case the previous create_subscription request failed
                 if not real_sub:
                     _logger.warning(
-                        f"Can't create nodes for {url} since underlying "
-                        f"subscription for {sub_name} doesn't exist"
+                        "Can't create nodes for %s since underlying "
+                        "subscription for %s doesn't exist", url, sub_name
                     )
                     continue
                 vs_real = real_map[url][sub_name]
@@ -252,13 +257,13 @@ class Reconciliator:
         client: Client,
         vs_real: VirtualSubscription,
         vs_ideal: VirtualSubscription,
-    ) -> List[Optional[asyncio.Task]]:
-        tasks = []
-        real_sub = self.name_to_subscription[url].get(sub_name)
+    ) -> List[asyncio.Task]:
+        tasks: List[asyncio.Task] = []
+        real_sub: Subscription = self.name_to_subscription[url].get(sub_name)
         monitoring = vs_real.monitoring
         node_to_add = set(vs_ideal.nodes) - set(vs_real.nodes)
         if node_to_add:
-            _logger.info(f"Adding {len(node_to_add)} Nodes")
+            _logger.info("Adding %d Nodes", len(node_to_add))
         # hack to group subscription by NodeAttributes
         attr_to_nodes = defaultdict(list)
         for node in node_to_add:
@@ -299,12 +304,12 @@ class Reconciliator:
         sub_name: str,
         vs_real: VirtualSubscription,
         vs_ideal: VirtualSubscription,
-    ) -> List[Optional[asyncio.Task]]:
-        to_del = []
+    ) -> List[asyncio.Task]:
+        to_del: List[asyncio.Task] = []
         node_to_del = set(vs_real.nodes) - set(vs_ideal.nodes)
-        real_sub = self.name_to_subscription[url].get(sub_name)
+        real_sub: Subscription = self.name_to_subscription[url].get(sub_name)
         if node_to_del:
-            _logger.info(f"Removing {len(node_to_del)} Nodes")
+            _logger.info("Removing %d Nodes", len(node_to_del))
             for batch_nodes in batch(node_to_del, self.BATCH_MI_SIZE):
                 node_handles = [self.node_to_handle[url][node] for node in batch_nodes]
                 task = asyncio.create_task(real_sub.unsubscribe(node_handles))
@@ -336,7 +341,7 @@ class Reconciliator:
                 # in case the previous create_subscription request failed
                 if not real_sub:
                     _logger.warning(
-                        f"Can't change modes for {url} since underlying subscription for {sub_name} doesn't exist"
+                        "Can't change modes for %s since underlying subscription for %s doesn't exist", url, sub_name
                     )
                     continue
                 vs_real = real_map[url][sub_name]
@@ -346,7 +351,7 @@ class Reconciliator:
                     ideal_val = getattr(vs_ideal, attr)
                     real_val = getattr(vs_real, attr)
                     if ideal_val != real_val:
-                        _logger.info(f"Changing {attr} for {sub_name} to {ideal_val}")
+                        _logger.info("Changing %s for %s to %s", attr, sub_name, ideal_val)
                         set_func = getattr(real_sub, func)
                         task = asyncio.create_task(set_func(ideal_val))
                         task.add_done_callback(
@@ -370,7 +375,7 @@ class Reconciliator:
         **kwargs,
     ) -> None:
         if fut.exception():
-            _logger.warning(f"Can't {action.value} on {url}: {fut.exception()}")
+            _logger.warning("Can't %s on %s: %s", action.value, url, fut.exception())
             return
         sub_name = kwargs["sub_name"]
         vs = self.real_map[url][sub_name]
@@ -378,7 +383,7 @@ class Reconciliator:
 
     def add_to_map(self, url: str, action: Method, fut: asyncio.Task, **kwargs) -> None:
         if fut.exception():
-            _logger.warning(f"Can't {action.value} on {url}: {fut.exception()}")
+            _logger.warning("Can't %s on %s: %s", action.value, url, fut.exception())
             self.hook_add_to_map_error(url=url, action=action, fut=fut, **kwargs)
             return
 
@@ -396,11 +401,11 @@ class Reconciliator:
                 if isinstance(handle, ua.StatusCode):
                     # a StatusCode is returned, the request has failed.
                     vs.unsubscribe([node])
-                    _logger.info(f"Node {node} subscription failed: {handle}")
+                    _logger.info("Node %s subscription failed: %s", node, handle)
                     # The node is invalid, remove it from both maps
                     if handle.name == "BadNodeIdUnknown":
                         _logger.warning(
-                            f"WARNING: Abandoning {node} because it returned {handle} from {url}"
+                            "WARNING: Abandoning %s because it returned %s from %s", node, handle, url
                         )
                         real_vs = self.ha_client.ideal_map[url][sub_name]
                         real_vs.unsubscribe([node])
@@ -413,13 +418,13 @@ class Reconciliator:
     ) -> None:
         if fut.exception():
             # log exception but continues to delete local resources
-            _logger.warning(f"Can't {action.value} on {url}: {fut.exception()}")
+            _logger.warning("Can't %s on %s: %s", action.value, url, fut.exception())
         sub_name = kwargs["sub_name"]
 
         if action == Method.DEL_SUB:
             self.real_map[url].pop(sub_name)
             self.name_to_subscription[url].pop(sub_name)
-            _logger.warning(f"In del_from_map del sub: {fut.result()}")
+            _logger.warning("In del_from_map del sub: %s", fut.result())
 
         if action == Method.DEL_MI:
             nodes = kwargs["nodes"]
@@ -436,3 +441,19 @@ class Reconciliator:
         for a in inspect.getmembers(self):
             if not a[0].startswith("__") and not inspect.ismethod(a[1]):
                 _logger.debug(a)
+
+    def hook_mi_request(self, url: str, sub_name: str, nodes: Set[SortedDict], action: Method):
+        """placeholder for easily superclass the HaClient and implement custom logic
+        """
+
+    def hook_add_to_map_error(self, url: str, action: Method, fut: asyncio.Task, **kwargs):
+        """placeholder for easily superclass the HaClient and implement custom logic
+        """
+
+    def hook_add_to_map(self, fut: asyncio.Task, url: str, action: Method, **kwargs):
+        """placeholder for easily superclass the HaClient and implement custom logic
+        """
+
+    def hook_del_from_map(self, fut: asyncio.Task, url: str, **kwargs):
+        """placeholder for easily superclass the HaClient and implement custom logic
+        """
